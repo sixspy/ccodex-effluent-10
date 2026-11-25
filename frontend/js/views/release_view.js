@@ -14,9 +14,12 @@ export const releaseViewTemplate = `
     </div>
     <div class="panel">
       <h3>签发准排</h3>
+      <p class="gate-hint">准排闸：无开放挂起，且正式指标对照限值重算合格、有生效正式裁定；未升正的影子裁定与旧超标指标一律拒绝。</p>
       <label>已裁定采样</label>
       <select v-model.number="releaseForm.sample_id">
-        <option v-for="s in releasableSamples" :key="s.id" :value="s.id">{{ s.sample_code }} · {{ s.status }}</option>
+        <option v-for="s in releasableSamples" :key="s.id" :value="s.id">
+          {{ s.sample_code }} · {{ s.status }}<template v-if="s.latest_adjudication"> · {{ s.latest_adjudication.lane }}/{{ s.latest_adjudication.status }}</template>
+        </option>
       </select>
       <label>值班员</label><input v-model="releaseForm.officer"/>
       <div class="actions"><button @click="createRelease">准排</button></div>

@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
-DB_PATH = DATA / "app.db"
+# EFFLUENT_DB 可指向独立库（并发验收/容器外演练用）；测试仍直接 monkeypatch db.DB_PATH。
+DB_PATH = Path(os.environ.get("EFFLUENT_DB", str(DATA / "app.db")))
 FIXTURES = ROOT / "fixtures"
 FRONTEND = ROOT / "frontend"
 
@@ -117,6 +119,33 @@ CREATE TABLE IF NOT EXISTS exceed_holds(
   note TEXT,
   FOREIGN KEY(sample_id) REFERENCES sample_batches(id)
 );
+CREATE TABLE IF NOT EXISTS metric_adjudications(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sample_id INTEGER NOT NULL,
+  hold_id INTEGER,
+  adjudication_no TEXT,
+  lane TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  path_code TEXT,
+  verdict TEXT NOT NULL,
+  result TEXT,
+  metrics TEXT NOT NULL,
+  official INTEGER NOT NULL DEFAULT 0,
+  promoted INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL,
+  source TEXT NOT NULL,
+  note TEXT,
+  shift_tag TEXT,
+  shift TEXT,
+  locked INTEGER NOT NULL DEFAULT 1,
+  actor TEXT,
+  adjudicated_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  promoted_at TEXT,
+  voided_at TEXT,
+  FOREIGN KEY(sample_id) REFERENCES sample_batches(id),
+  FOREIGN KEY(hold_id) REFERENCES exceed_holds(id)
+);
 CREATE TABLE IF NOT EXISTS discharge_releases(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   sample_id INTEGER NOT NULL,
@@ -186,6 +215,10 @@ CREATE TABLE IF NOT EXISTS sludge_plan_jobs(
   detail TEXT,
   created_at TEXT NOT NULL
 );
+-- 裁定台账的只读同源别名（不同验收口径可能用不同表名，全部指向同一本账）。
+CREATE VIEW IF NOT EXISTS adjudications AS SELECT * FROM metric_adjudications;
+CREATE VIEW IF NOT EXISTS sample_adjudications AS SELECT * FROM metric_adjudications;
+CREATE VIEW IF NOT EXISTS adjudication_records AS SELECT * FROM metric_adjudications;
 """
 
 
@@ -442,9 +475,32 @@ def seed_lineage(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """老库幂等补列（CREATE TABLE IF NOT EXISTS 不会给已存在的表加列）。"""
+    additions = {
+        "exceed_holds": [
+            ("recalc_at", "TEXT"),
+            ("adjudication_id", "INTEGER"),
+            ("recalc_lane", "TEXT"),
+        ],
+        "sample_batches": [
+            ("recalc_at", "TEXT"),
+        ],
+        "metric_adjudications": [
+            ("shift", "TEXT"),
+        ],
+    }
+    for table, cols in additions.items():
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in cols:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         seed_users(conn)
         seed_plants(conn)
         seed_outfalls(conn)

@@ -198,3 +198,24 @@ pre {
   max-height: 280px;
   overflow: auto;
 }
+.close-recalc-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(7.5rem, 1fr));
+  gap: 0.4rem;
+  align-items: end;
+}
+.close-recalc-grid label {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.close-recalc-grid input,
+.close-recalc-grid select {
+  width: 100%;
+  margin-top: 0.15rem;
+}
+.gate-hint {
+  font-size: 0.82rem;
+  color: var(--muted);
+  margin: 0.2rem 0 0.6rem;
+}

@@ -1,13 +1,16 @@
 """准排放裁定放行。"""
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, HTTPException
 
+from adjudication_svc import ledger_release_blocker, limits_for_sample
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
 from locks import release, require_lock
 from models import ReleaseIn
-from validators import validate_sample_releasable
+from validators import adjudicate_exceed, validate_sample_releasable
 
 router = APIRouter(tags=["release"])
 
@@ -44,6 +47,21 @@ def create_release(body: ReleaseIn, authorization: AuthHeader = None):
             ).fetchone()
             if open_hold:
                 raise HTTPException(400, "仍有开放超标挂起，禁止准排")
+            # 闸一：正式指标列必须对照排放口限值重算合格，拒绝“闭了挂起但指标仍旧超标”的假绿。
+            metrics = json.loads(sample["metrics"] or "{}")
+            exceeded, metric, measured, limit = adjudicate_exceed(
+                metrics, limits_for_sample(conn, sample)
+            )
+            if exceeded:
+                raise HTTPException(
+                    400,
+                    f"准排页拒绝旧超标指标：{metric}={measured:g} 仍超限值 {limit:g}，"
+                    "须先闭环同重裁合格（甲）或把已升正影子裁定写入正式列（乙）",
+                )
+            # 闸二：有裁定台账时，最新一条必须是合格生效正式裁定；未升正影子不得充数。
+            ledger_block = ledger_release_blocker(conn, body.sample_id)
+            if ledger_block:
+                raise HTTPException(400, ledger_block)
             existing = conn.execute(
                 "SELECT id FROM discharge_releases WHERE sample_id=? AND status='已准排'",
                 (body.sample_id,),

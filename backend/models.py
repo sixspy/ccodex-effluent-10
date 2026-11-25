@@ -1,7 +1,7 @@
 """Pydantic 入参模型。"""
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class PlantIn(BaseModel):
@@ -42,8 +42,47 @@ class ExceedOpenIn(BaseModel):
 
 
 class ExceedCloseIn(BaseModel):
+    # 允许验收方以额外字段携带复测/重裁指标与口径，提取层会统一识别。
+    model_config = ConfigDict(extra="allow")
+
     hold_id: int
     note: str = ""
+    # 甲路径：同事务写入正式指标列的复测值（多个别名都认）。
+    metrics: dict | None = None
+    new_metrics: dict | None = None
+    recalc_metrics: dict | None = None
+    retest_metrics: dict | None = None
+    corrected_metrics: dict | None = None
+    metrics_patch: dict | None = None
+    retest: dict | None = None
+    recalc: dict | None = None
+    # 口径选择：formal/甲（默认，同事务正式重裁）或 shadow/乙（只落影子裁定）。
+    lane: str | None = None
+    mode: str | None = None
+    path: str | None = None
+    strategy: str | None = None
+    shadow: bool | None = None
+    as_shadow: bool | None = None
+    # 也允许直接平铺三个指标。
+    cod: float | None = None
+    nh3n: float | None = None
+    tp: float | None = None
+
+
+class RetestIn(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    metrics: dict | None = None
+    new_metrics: dict | None = None
+    recalc_metrics: dict | None = None
+    retest_metrics: dict | None = None
+    lane: str | None = None
+    mode: str | None = None
+    shadow: bool | None = None
+    note: str = ""
+    cod: float | None = None
+    nh3n: float | None = None
+    tp: float | None = None
 
 
 class ReleaseIn(BaseModel):

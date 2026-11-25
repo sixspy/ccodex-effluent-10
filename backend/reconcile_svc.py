@@ -41,8 +41,10 @@ def _reconcile_permit(conn, permit_code: str) -> dict:
         "SELECT * FROM discharge_permits WHERE permit_code=?", (permit_code,)
     ).fetchone()
     samples = conn.execute(
-        """SELECT sample_code, flow_m3h, metrics, status, generation FROM sample_batches
-           WHERE permit_ref=? AND status NOT IN ('作废')""",
+        """SELECT s.id, s.sample_code, s.flow_m3h, s.metrics, s.status,
+                  s.generation, s.adjudicated_at
+           FROM sample_batches s
+           WHERE s.permit_ref=? AND s.status NOT IN ('作废')""",
         (permit_code,),
     ).fetchall()
     if not samples:
@@ -59,6 +61,7 @@ def _reconcile_permit(conn, permit_code: str) -> dict:
     }
     details = []
     all_ok = True
+    adjudication_consistent_all = True
     for s in samples:
         metrics = json.loads(s["metrics"] or "{}")
         ok = validate_permit_match(
@@ -66,6 +69,38 @@ def _reconcile_permit(conn, permit_code: str) -> dict:
         )
         if not ok:
             all_ok = False
+
+        latest_adj = conn.execute(
+            """SELECT id, adjudication_no, lane, kind, path_code, verdict, status,
+                      metrics AS adj_metrics, adjudicated_at, promoted
+               FROM metric_adjudications WHERE sample_id=?
+               ORDER BY id DESC LIMIT 1""",
+            (s["id"],),
+        ).fetchone()
+        adjudication_brief = None
+        adjudication_consistent = None
+        if latest_adj is not None:
+            adj_metrics = json.loads(latest_adj["adj_metrics"] or "{}")
+            same_metrics = all(
+                abs(float(metrics.get(k, 0)) - float(adj_metrics.get(k, 0))) < 1e-9
+                for k in ("cod", "nh3n", "tp")
+            )
+            adjudication_consistent = bool(same_metrics)
+            if not adjudication_consistent:
+                adjudication_consistent_all = False
+            adjudication_brief = {
+                "id": latest_adj["id"],
+                "adjudication_no": latest_adj["adjudication_no"],
+                "lane": latest_adj["lane"],
+                "kind": latest_adj["kind"],
+                "path": latest_adj["path_code"],
+                "verdict": latest_adj["verdict"],
+                "status": latest_adj["status"],
+                "adjudicated_at": latest_adj["adjudicated_at"],
+                "promoted": bool(latest_adj["promoted"]),
+                "consistent_with_metrics": adjudication_consistent,
+            }
+
         details.append(
             {
                 "sample_code": s["sample_code"],
@@ -74,6 +109,10 @@ def _reconcile_permit(conn, permit_code: str) -> dict:
                 "metrics": metrics,
                 "flow_m3h": s["flow_m3h"],
                 "matched": ok,
+                "adjudicated_at": s["adjudicated_at"],
+                "adjudication": adjudication_brief,
+                # 对账指标是否与新裁定同源一致（无裁定台账时为 null，不臆断）。
+                "adjudication_consistent": adjudication_consistent,
             }
         )
     seal_rows = conn.execute(
@@ -89,6 +128,7 @@ def _reconcile_permit(conn, permit_code: str) -> dict:
         "balanced": all_ok,
         "proof_ready": all_ok and len(seal_rows) >= 1,
         "seal_count": len(seal_rows),
+        "adjudication_consistent_all": adjudication_consistent_all,
         "samples": details,
         "seals": [dict(x) for x in seal_rows],
     }

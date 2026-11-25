@@ -7,6 +7,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from audit_svc import router as audit_router
+from adjudication_svc import router as adjudication_router
 from auth import router as auth_router
 from db import FRONTEND, PRODUCT_META, init_db
 from exceed_svc import router as exceed_router
@@ -36,6 +37,7 @@ app.add_middleware(
 
 for r in (
     auth_router,
+    adjudication_router,
     plants_router,
     outfalls_router,
     samples_router,

@@ -49,19 +49,26 @@ def test_sample_exceed_release_seal_flow():
     assert created["status"] == "旁路挂起"
     holds = c.get("/api/exceeds?status=开放", headers=h).json()["items"]
     hold = next(x for x in holds if x["sample_code"] == "SM-FLOW-001")
+    # effluent-10：闭环须同事务重裁。加药回调后复测合格，随闭环写新裁定。
     close = c.post(
         "/api/exceeds/close",
         headers=h,
-        json={"hold_id": hold["id"], "note": "加药回调"},
+        json={
+            "hold_id": hold["id"],
+            "note": "加药回调",
+            "metrics": {"cod": 40.0, "nh3n": 2.4, "tp": 0.18},
+        },
     )
-    assert close.status_code == 200
-    assert close.json()["sample_adjudicated"] is True
+    assert close.status_code == 200, close.text
+    close_body = close.json()
+    assert close_body["sample_adjudicated"] is True
+    assert close_body["adjudication_id"]
     release = c.post(
         "/api/releases",
         headers=h,
         json={"sample_id": created["id"], "officer": "验收员"},
     )
-    assert release.status_code == 200
+    assert release.status_code == 200, release.text
     seal = c.post("/api/seals", headers=h, json={"sample_id": created["id"]})
     assert seal.status_code == 200
     assert seal.json()["generation"] == 2

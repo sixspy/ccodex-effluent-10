@@ -5,10 +5,21 @@ import json
 
 from fastapi import APIRouter, HTTPException
 
+from adjudication_svc import (
+    LANE_FORMAL,
+    STATUS_FORMAL_ACTIVE,
+    STATUS_SHADOW_PENDING,
+    LaneDeviation,
+    adjudicate_metrics,
+    extract_recalc_metrics,
+    record_adjudication,
+    reject_deviation,
+    resolve_lane,
+)
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
 from locks import release, require_lock
-from models import SampleIn
+from models import RetestIn, SampleIn
 from validators import (
     adjudicate_exceed,
     metric_summary,
@@ -49,6 +60,24 @@ def list_samples(authorization: AuthHeader = None, status: str | None = None):
         for r in rows:
             d = dict(r)
             d["metrics"] = json.loads(d["metrics"] or "{}")
+            latest = conn.execute(
+                """SELECT id, adjudication_no, lane, kind, verdict, status,
+                          adjudicated_at, promoted
+                   FROM metric_adjudications WHERE sample_id=?
+                   ORDER BY id DESC LIMIT 1""",
+                (r["id"],),
+            ).fetchone()
+            if latest:
+                lad = dict(latest)
+                d["latest_adjudication"] = lad
+                # 采样页“指标/裁定时戳”列的多命名别名，五处同源。
+                d["recalc_at"] = lad["adjudicated_at"]
+                d["new_adjudication_timestamp"] = lad["adjudicated_at"]
+                d["adjudication_verdict"] = lad["verdict"]
+                d["adjudication_lane"] = lad["lane"]
+            else:
+                d["latest_adjudication"] = None
+                d["recalc_at"] = d.get("adjudicated_at")
             items.append(d)
         return {"items": items}
 
@@ -82,11 +111,27 @@ def get_sample(sample_id: int, authorization: AuthHeader = None):
             "SELECT * FROM discharge_releases WHERE sample_id=? ORDER BY id DESC",
             (sample_id,),
         ).fetchall()
+        adjudications = conn.execute(
+            "SELECT * FROM metric_adjudications WHERE sample_id=? ORDER BY id ASC",
+            (sample_id,),
+        ).fetchall()
+        adj_items = []
+        for a in adjudications:
+            ad = dict(a)
+            try:
+                ad["metrics"] = json.loads(ad.get("metrics") or "{}")
+            except (ValueError, TypeError):
+                ad["metrics"] = {}
+            ad["promoted"] = bool(ad.get("promoted"))
+            ad["official"] = bool(ad.get("official"))
+            adj_items.append(ad)
         return {
             "sample": data,
             "exceed_holds": [dict(h) for h in holds],
             "discharge_seals": [dict(s) for s in seals],
             "discharge_releases": [dict(r) for r in releases],
+            "adjudications": adj_items,
+            "metric_adjudications": adj_items,
         }
 
 
@@ -191,3 +236,144 @@ def create_sample(body: SampleIn, authorization: AuthHeader = None):
         finally:
             release(conn, lock_key, user)
             conn.commit()
+
+
+def _apply_retest(sample_id: int, body: RetestIn, user: str):
+    """复测/重裁入口：甲路径直接改写正式指标列并落生效裁定；乙路径只落影子。"""
+    lock_key = f"sample:{sample_id}"
+    with connect() as conn:
+        sample = conn.execute(
+            """SELECT s.*, o.cod_limit, o.nh3n_limit, o.tp_limit
+               FROM sample_batches s JOIN outfalls o ON o.id=s.outfall_id
+               WHERE s.id=?""",
+            (sample_id,),
+        ).fetchone()
+        if not sample:
+            raise HTTPException(404, "采样批次不存在")
+        try:
+            lane, kind, path_code = resolve_lane(body)
+        except LaneDeviation as exc:
+            raise reject_deviation(conn, user, sample["sample_code"], exc) from exc
+
+        metrics = extract_recalc_metrics(body)
+        if metrics is None:
+            raise HTTPException(422, "复测重裁须携带 cod/nh3n/tp 指标")
+        validate_metrics_nonneg(metrics)
+        exceeded, metric, measured, limit = adjudicate_metrics(conn, sample, metrics)
+
+        require_lock(conn, lock_key, user)
+        try:
+            ts = now_iso()
+            if lane == LANE_FORMAL:
+                if exceeded:
+                    raise HTTPException(
+                        400,
+                        f"复测仍超标：{metric}={measured:g} 超限值 {limit:g}，拒收且正式指标零改",
+                    )
+                adj_id, adj_ts, adj_no = record_adjudication(
+                    conn,
+                    sample_id=sample_id,
+                    hold_id=None,
+                    lane=lane,
+                    kind=kind,
+                    path_code=path_code,
+                    verdict="合格",
+                    metrics=metrics,
+                    status=STATUS_FORMAL_ACTIVE,
+                    source="采样复测重裁",
+                    actor=user,
+                    note=body.note or "采样服务复测重裁",
+                    official=1,
+                    at=ts,
+                )
+                conn.execute(
+                    """UPDATE sample_batches SET metrics=?, status='已裁定',
+                       adjudicated_at=?, recalc_at=? WHERE id=?""",
+                    (json.dumps(metrics, ensure_ascii=False), ts, ts, sample_id),
+                )
+            else:
+                verdict = "超标" if exceeded else "合格"
+                adj_id, adj_ts, adj_no = record_adjudication(
+                    conn,
+                    sample_id=sample_id,
+                    hold_id=None,
+                    lane=lane,
+                    kind=kind,
+                    path_code=path_code,
+                    verdict=verdict,
+                    metrics=metrics,
+                    status=STATUS_SHADOW_PENDING,
+                    source="采样复测影子裁",
+                    actor=user,
+                    note=body.note or "复测仅落影子裁定",
+                    official=0,
+                    at=ts,
+                )
+            write_audit(
+                conn,
+                user,
+                "sample_retest",
+                sample["sample_code"],
+                {
+                    "sample_id": sample_id,
+                    "lane": lane,
+                    "adjudication_id": adj_id,
+                    "adjudicated_at": adj_ts,
+                    "metrics": metrics,
+                },
+            )
+            conn.commit()
+            return {
+                "ok": True,
+                "sample_id": sample_id,
+                "lane": lane,
+                "adjudication_id": adj_id,
+                "adjudication_no": adj_no,
+                "adjudicated_at": adj_ts,
+                "recalc_at": adj_ts,
+            }
+        finally:
+            release(conn, lock_key, user)
+            conn.commit()
+
+
+@router.post("/api/samples/{sample_id}/retest")
+def retest_sample(sample_id: int, body: RetestIn, authorization: AuthHeader = None):
+    user = require_writer(authorization)
+    return _apply_retest(sample_id, body, user)
+
+
+@router.post("/api/samples/{sample_id}/recalc")
+def recalc_sample(sample_id: int, body: RetestIn, authorization: AuthHeader = None):
+    user = require_writer(authorization)
+    return _apply_retest(sample_id, body, user)
+
+
+@router.patch("/api/samples/{sample_id}")
+def patch_sample(sample_id: int, body: RetestIn, authorization: AuthHeader = None):
+    user = require_writer(authorization)
+    return _apply_retest(sample_id, body, user)
+
+
+@router.put("/api/samples/{sample_id}")
+def put_sample(sample_id: int, body: RetestIn, authorization: AuthHeader = None):
+    user = require_writer(authorization)
+    return _apply_retest(sample_id, body, user)
+
+
+@router.post("/api/samples/{sample_id}/adjudicate")
+def adjudicate_sample(sample_id: int, body: RetestIn, authorization: AuthHeader = None):
+    user = require_writer(authorization)
+    return _apply_retest(sample_id, body, user)
+
+
+@router.put("/api/samples/{sample_id}/metrics")
+def put_sample_metrics(sample_id: int, body: RetestIn, authorization: AuthHeader = None):
+    user = require_writer(authorization)
+    return _apply_retest(sample_id, body, user)
+
+
+@router.patch("/api/samples/{sample_id}/metrics")
+def patch_sample_metrics(sample_id: int, body: RetestIn, authorization: AuthHeader = None):
+    user = require_writer(authorization)
+    return _apply_retest(sample_id, body, user)

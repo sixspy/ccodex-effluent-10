@@ -57,6 +57,8 @@ createApp({
     });
     const releaseForm = ref({ sample_id: 0, officer: "值班员" });
     const sealForm = ref({ sample_id: 0, snapshot: "" });
+    // 超标页每个开放挂起一份“闭环重裁”草稿（复测三指标 + 甲/乙口径 + 拍板说明）。
+    const closeDrafts = ref({});
     const permitForm = ref({
       permit_code: "DP-NEW-01", plant_id: 1, quota_m3d: 18000,
       cod_cap: 50, nh3n_cap: 5, tp_cap: 0.5, period_label: "2026Q4",
@@ -163,7 +165,56 @@ createApp({
         },
       }));
     }
+    function closeDraft(h) {
+      if (!closeDrafts.value[h.id]) {
+        // 复测值默认留空：留空=按在库指标如实重裁；三格全填才作为纠正复测值改写正式列。
+        closeDrafts.value[h.id] = {
+          cod: "",
+          nh3n: "",
+          tp: "",
+          note: "",
+          lane: "formal",
+        };
+      }
+      return closeDrafts.value[h.id];
+    }
+    async function submitClose(h) {
+      const d = closeDraft(h);
+      const payload = {
+        hold_id: h.id,
+        note: (d.note || "").trim() || "页面闭环重裁，拍板当班锁死",
+        lane: d.lane,
+      };
+      const nums = { cod: d.cod, nh3n: d.nh3n, tp: d.tp };
+      const filled = Object.values(nums).every(
+        (v) => v !== "" && v !== null && v !== undefined && Number.isFinite(Number(v))
+      );
+      if (filled) {
+        payload.metrics = {
+          cod: Number(nums.cod),
+          nh3n: Number(nums.nh3n),
+          tp: Number(nums.tp),
+        };
+      }
+      await flash(() => api.closeExceed(payload));
+    }
     async function closeExceed(id) { await flash(() => api.closeExceed({ hold_id: id, note: "页面闭环" })); }
+    async function promoteAdj(id) {
+      await flash(async () => {
+        await api.promoteAdjudication(id);
+        if (sampleDetail.value) {
+          sampleDetail.value = await api.sample(sampleDetail.value.sample.id);
+        }
+      });
+    }
+    async function voidAdj(id) {
+      await flash(async () => {
+        await api.voidAdjudication(id);
+        if (sampleDetail.value) {
+          sampleDetail.value = await api.sample(sampleDetail.value.sample.id);
+        }
+      });
+    }
     async function createRelease() { await flash(() => api.createRelease(releaseForm.value)); }
     async function createSeal() {
       await flash(() => api.createSeal({
@@ -223,6 +274,7 @@ createApp({
       reconOne, reconAllItems, proofOne, reconCode, proofCode,
       plantForm, outfallForm, sampleForm, releaseForm, sealForm, permitForm,
       lineageForm, labForm, sludgeForm, releasableSamples, sealableSamples,
+      closeDrafts, closeDraft, submitClose, promoteAdj, voidAdj,
       login, logout, refresh, statusClass, sampleClass, fmtMetrics,
       loadPlant, loadSample, createPlant, createOutfall, createSample,
       closeExceed, createRelease, createSeal, createPermit, createLineage,
